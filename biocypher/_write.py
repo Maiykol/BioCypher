@@ -9,82 +9,46 @@
 # Distributed under GPLv3 license, see the file `LICENSE`.
 #
 """
-Export of CSV files for the Neo4J admin import. The admin import is able
-to quickly transfer large amounts of content into an unused database. For more
-explanation, see https://neo4j.com/docs/operations-manual/current/tuto\
-rial/neo4j-admin-import/.
-
-Import like that:
-https://community.neo4j.com/t/how-can-i-use-a-database-created-with-neo4j-\
-admin-import-in-neo4j-desktop/40594
-
-    - Can properties the node/relationship does not own be left blank?
+Abstract class for a writer to create csv files which can be used to import the data into a database. Intended to be inherited by database-specific writers with database-specific methods. This writer class contains t
 
 Formatting: --delimiter=";"
             --array-delimiter="|"
             --quote="'"
 
-The header contains information for each field, for ID and properties
-in the format <name>: <field_type>. E.g.:
-`UniProtKB:ID;genesymbol;entrez_id:int;:LABEL`. Multiple labels can
-be given by separating with the array delimiter.
-
-There are three mandatory fields for relationship data:
-:START_ID — ID referring to a node.
-:END_ID — ID referring to a node.
-:TYPE — The relationship type.
-
-E.g.: `:START_ID;relationship_id;residue;:END_ID;:TYPE`.
-
+The header contains information for each field, for ID and properties.
 Headers would best be separate files, data files with similar name but
-different ending. Example from Neo4j documentation:
-
-.. code-block:: bash
-
-   bin/neo4j-admin import --database=neo4j
-   --nodes=import/entities-header.csv,import/entities-part1.csv,
-    import/entities-part2.csv
-   --nodes=import/interactions-header.csv,import/interactions-part1.csv,
-    import/interaction-part2.csv
-   --relationships=import/rels-header.csv,import/rels-part1.csv,
-    import/rels-part2.csv
-
-Can use regex, e.g., [..] import/rels-part*. In this case, use padding
-for ordering of the earlier part files ("01, 02").
+different ending.
 
 # How to import:
 
 1. stop the db
 
-2. shell command:
-
-.. code-block:: bash
-
-   bin/neo4j-admin import --database=neo4j
-   # nodes per type, separate header, regex for parts:
-   --nodes="<path>/<node_type>-header.csv,<path>/<node_type>-part.*"
-   # edges per type, separate header, regex for parts:
-   --relationships="<path>/<edge_type>-header.csv,<path>/<edge_type>-part.*"
+2. shell command
 
 3. start db, test for consistency
+
+A child-class of this class must implement these methods:
+- _write_node_headers
+- _write_edge_headers
+- write_import_call
+- _construct_import_call
+
 """
 
+from abc import ABC, abstractmethod
+from ._create import BioCypherEdge, BioCypherNode, BioCypherRelAsNode
+from biocypher._config import config as _config
+from more_itertools import peekable
+import os
+from collections import OrderedDict, defaultdict
+from datetime import datetime
+from typing import TYPE_CHECKING, Union, Optional
+from types import GeneratorType
 import glob
 
 from ._logger import logger
 
 logger.debug(f'Loading module {__name__}.')
-
-from types import GeneratorType
-from typing import TYPE_CHECKING, Union, Optional
-from datetime import datetime
-from collections import OrderedDict, defaultdict
-import os
-
-from more_itertools import peekable
-
-from biocypher._config import config as _config
-from ._create import BioCypherEdge, BioCypherNode, BioCypherRelAsNode
 
 __all__ = ['BatchWriter']
 
@@ -95,10 +59,10 @@ if TYPE_CHECKING:
 # TODO retrospective check of written csvs?
 
 
-class BatchWriter:
+class BatchWriter(ABC):
     """
-    Class for writing node and edge representations to disk using the
-    format specified by Neo4j for the use of admin import. Each batch
+    Class for writing node and edge representations to disk using csv format and creating a bash command to import the data.
+    Each batch
     writer instance has a fixed representation that needs to be passed
     at instantiation via the :py:attr:`schema` argument. The instance
     also expects an ontology adapter via :py:attr:`ontology_adapter` to be able
@@ -125,7 +89,7 @@ class BatchWriter:
             Path for exporting CSV files.
 
         db_name:
-            Name of the Neo4j database that will be used in the generated
+            Name of the database that will be used in the generated
             commands.
 
         skip_bad_relationships:
@@ -142,16 +106,17 @@ class BatchWriter:
         strict_mode:
             Whether to enforce source, version, and license properties.
     """
+
     def __init__(
         self,
         leaves: dict,
         ontology_adapter: 'OntologyAdapter',
         translator: 'Translator',
         delimiter: str,
-        array_delimiter: str,
-        quote: str,
+        array_delimiter: str = '|',
+        quote: str  = '"',
         dirname: Optional[str] = None,
-        db_name: str = 'neo4j',
+        db_name: str = '',
         skip_bad_relationships: bool = False,
         skip_duplicate_nodes: bool = False,
         wipe: bool = True,
@@ -173,12 +138,12 @@ class BatchWriter:
         self.translator = translator
         self.node_property_dict = {}
         self.edge_property_dict = {}
-        self.import_call_nodes = ''
-        self.import_call_edges = ''
+        self.import_call_nodes = []
+        self.import_call_edges = []
 
-        timestamp = lambda: datetime.now().strftime('%Y%m%d%H%M')
+        timestamp = datetime.now().strftime('%Y%m%d%H%M')
 
-        self.outdir = dirname or os.path.join(_config('outdir'), timestamp())
+        self.outdir = dirname or os.path.join(_config('outdir'), timestamp)
         self.outdir = os.path.abspath(self.outdir)
 
         logger.info(f'Creating output directory `{self.outdir}`.')
@@ -460,76 +425,17 @@ class BatchWriter:
 
                 return self._write_node_data(gen(nodes), batch_size=batch_size)
 
+    @abstractmethod
     def _write_node_headers(self):
         """
-        Writes single CSV file for a graph entity that is represented
-        as a node as per the definition in the `schema_config.yaml`,
-        containing only the header for this type of node.
+        Abstract method that takes care of importing properties of a graph entity that is represented
+        as a node as per the definition in the `schema_config.yaml`
 
         Returns:
             bool: The return value. True for success, False otherwise.
         """
-        # load headers from data parse
-        if not self.node_property_dict:
-            logger.error(
-                'Header information not found. Was the data parsed first?',
-            )
-            return False
-
-        for label, props in self.node_property_dict.items():
-            # create header CSV with ID, properties, labels
-
-            _id = ':ID'
-
-            # to programmatically define properties to be written, the
-            # data would have to be parsed before writing the header.
-            # alternatively, desired properties can also be provided
-            # via the schema_config.yaml.
-
-            # translate label to PascalCase
-            pascal_label = self.translator.name_sentence_to_pascal(label)
-
-            header_path = os.path.join(
-                self.outdir,
-                f'{pascal_label}-header.csv',
-            )
-            parts_path = os.path.join(self.outdir, f'{pascal_label}-part.*')
-
-            # check if file already exists
-            if not os.path.exists(header_path):
-
-                # concatenate key:value in props
-                props_list = []
-                for k, v in props.items():
-                    if v in ['int', 'long']:
-                        props_list.append(f'{k}:long')
-                    elif v in ['float', 'double', 'dbl']:
-                        props_list.append(f'{k}:double')
-                    elif v in ['bool', 'boolean']:
-                        # TODO Neo4j boolean support / spelling?
-                        props_list.append(f'{k}:boolean')
-                    elif v in ['str[]', 'string[]']:
-                        props_list.append(f'{k}:string[]')
-                    else:
-                        props_list.append(f'{k}')
-
-                # create list of lists and flatten
-                # removes need for empty check of property list
-                out_list = [[_id], props_list, [':LABEL']]
-                out_list = [val for sublist in out_list for val in sublist]
-
-                with open(header_path, 'w', encoding='utf-8') as f:
-
-                    # concatenate with delimiter
-                    row = self.delim.join(out_list)
-                    f.write(row)
-
-                # add file path to neo4 admin import statement
-                self.import_call_nodes += (
-                    f'--nodes="{header_path},{parts_path}" '
-                )
-
-        return True
+        raise NotImplementedError(
+            "Database writer must override '_write_node_headers'")
 
     def _write_single_node_list_to_file(
         self,
@@ -540,7 +446,7 @@ class BatchWriter:
     ):
         """
         This function takes one list of biocypher nodes and writes them
-        to a Neo4j admin import compatible CSV file.
+        to an import compatible CSV file.
 
         Args:
             node_list (list): list of BioCypherNodes to be written
@@ -791,71 +697,18 @@ class BatchWriter:
 
                 return self._write_edge_data(gen(edges), batch_size=batch_size)
 
+    @abstractmethod
     def _write_edge_headers(self):
         """
-        Writes single CSV file for a graph entity that is represented
+        Abstract method to write a database import-file for a graph entity that is represented
         as an edge as per the definition in the `schema_config.yaml`,
         containing only the header for this type of edge.
 
         Returns:
             bool: The return value. True for success, False otherwise.
         """
-        # load headers from data parse
-        if not self.edge_property_dict:
-            logger.error(
-                'Header information not found. Was the data parsed first?',
-            )
-            return False
-
-        for label, props in self.edge_property_dict.items():
-            # create header CSV with :START_ID, (optional) properties,
-            # :END_ID, :TYPE
-
-            # translate label to PascalCase
-            pascal_label = self.translator.name_sentence_to_pascal(label)
-
-            # paths
-            header_path = os.path.join(
-                self.outdir,
-                f'{pascal_label}-header.csv',
-            )
-            parts_path = os.path.join(self.outdir, f'{pascal_label}-part.*')
-
-            # check for file exists
-            if not os.path.exists(header_path):
-
-                # concatenate key:value in props
-                props_list = []
-                for k, v in props.items():
-                    if v in ['int', 'long']:
-                        props_list.append(f'{k}:long')
-                    elif v in ['float', 'double']:
-                        props_list.append(f'{k}:double')
-                    elif v in [
-                        'bool',
-                        'boolean',
-                    ]:  # TODO does Neo4j support bool?
-                        props_list.append(f'{k}:boolean')
-                    else:
-                        props_list.append(f'{k}')
-
-                # create list of lists and flatten
-                # removes need for empty check of property list
-                out_list = [[':START_ID'], props_list, [':END_ID'], [':TYPE']]
-                out_list = [val for sublist in out_list for val in sublist]
-
-                with open(header_path, 'w', encoding='utf-8') as f:
-
-                    # concatenate with delimiter
-                    row = self.delim.join(out_list)
-                    f.write(row)
-
-                # add file path to neo4 admin import statement
-                self.import_call_edges += (
-                    f'--relationships="{header_path},{parts_path}" '
-                )
-
-        return True
+        raise NotImplementedError(
+            "Database writer must override '_write_edge_headers'")
 
     def _write_single_edge_list_to_file(
         self,
@@ -865,7 +718,7 @@ class BatchWriter:
     ):
         """
         This function takes one list of biocypher edges and writes them
-        to a Neo4j admin import compatible CSV file.
+        to an admin import compatible CSV file.
 
         Args:
             edge_list (list): list of BioCypherEdges to be written
@@ -1022,7 +875,7 @@ class BatchWriter:
         delimiters and database name.
 
         Returns:
-            str: a bash command for neo4j-admin import
+            str: a bash command for csv import
         """
 
         return self._construct_import_call()
@@ -1035,17 +888,22 @@ class BatchWriter:
 
         Returns:
             bool: The return value. True for success, False otherwise.
+
+        Template:
+            file_path = os.path.join(self.outdir, '<database>-import-call.sh')
+            logger.info(f'Writing <database> import call to `{file_path}`.')
+
+            with open(file_path, 'w', encoding='utf-8') as f:
+
+                f.write(self._construct_import_call())
+
+            return True
         """
+        raise NotImplementedError(
+            "Database writer must override 'write_import_call'"
+        )
 
-        file_path = os.path.join(self.outdir, 'neo4j-admin-import-call.sh')
-        logger.info(f'Writing neo4j-admin import call to `{file_path}`.')
-
-        with open(file_path, 'w', encoding='utf-8') as f:
-
-            f.write(self._construct_import_call())
-
-        return True
-
+    @abstractmethod
     def _construct_import_call(self) -> str:
         """
         Function to construct the import call detailing folder and
@@ -1054,35 +912,11 @@ class BatchWriter:
         processed to ensure that nodes are called before any edges.
 
         Returns:
-            str: a bash command for neo4j-admin import
+            str: a bash command for csv import
         """
-
-        # escape backslashes in self.delim and self.adelim
-        delim = self.delim.replace('\\', '\\\\')
-        adelim = self.adelim.replace('\\', '\\\\')
-
-        import_call = (
-            f'bin/neo4j-admin import --database={self.db_name} '
-            f'--delimiter="{delim}" --array-delimiter="{adelim}" '
+        raise NotImplementedError(
+            "Database writer must override '_construct_import_call'"
         )
-
-        if self.quote == "'":
-            import_call += f'--quote="{self.quote}" '
-        else:
-            import_call += f"--quote='{self.quote}' "
-
-        if self.wipe:
-            import_call += f'--force=true '
-        if self.skip_bad_relationships:
-            import_call += '--skip-bad-relationships=true '
-        if self.skip_duplicate_nodes:
-            import_call += '--skip-duplicate-nodes=true '
-
-        # append node and edge import calls
-        import_call += self.import_call_nodes
-        import_call += self.import_call_edges
-
-        return import_call
 
     def get_duplicate_nodes(self):
         """

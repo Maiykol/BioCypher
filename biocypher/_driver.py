@@ -9,57 +9,46 @@
 # Distributed under GPLv3 license, see the file `LICENSE`.
 #
 """
-A wrapper around the Neo4j driver which handles the DBMS connection and
-provides basic management methods.
+A abstract driver class intended to be used as a parent to database-specific drivers.
+It handles the DBMS connection and provides basic management methods.
 """
+from ._translate import Translator, BiolinkAdapter, OntologyAdapter
+from ._create import VersionNode, BioCypherEdge, BioCypherNode
+from ._config import config as _config
+from more_itertools import peekable
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Optional
 from collections.abc import Iterable
 
 from ._logger import logger
 
 logger.debug(f'Loading module {__name__}.')
 
-from typing import TYPE_CHECKING, List, Optional, Generator
-import importlib as imp
-import itertools
-
-from more_itertools import peekable
 
 if TYPE_CHECKING:
 
     import neo4j
 
-import neo4j_utils
-
-from . import _misc
-from ._write import BatchWriter
-from ._config import config as _config
-from ._create import VersionNode, BioCypherEdge, BioCypherNode
-from ._translate import Translator, BiolinkAdapter, OntologyAdapter
 
 __all__ = ['Driver']
 
 
-class Driver(neo4j_utils.Driver):
+class Driver(ABC):
     """
-    Manages a connection to a biocypher database.
-
-    The connection can be defined in three ways:
-        * Providing a ready ``neo4j.Driver`` instance
-        * By URI and authentication data
-        * By a YAML config file
+    Abstract parent class for BioCypher database drivers. 
+        * Provides basic functions needed by all drivers to 
+            implement the BioCyher features. 
+        * Child classes can add database-specific functionalities.
 
     Args:
-        driver:
-            A ``neo4j.Driver`` instance, created by, for example,
-            ``neo4j.GraphDatabase.driver``.
         db_name:
-            Name of the database (Neo4j graph) to use.
+            Name of the database to use.
         db_uri:
-            Protocol, host and port to access the Neo4j server.
+            Protocol, host and port to access the database server.
         db_user:
-            Neo4j user name.
+            database user name.
         db_passwd:
-            Password of the Neo4j user.
+            Password of the database user.
         fetch_size:
             Optional; the fetch size to use in database transactions.
         wipe:
@@ -99,14 +88,14 @@ class Driver(neo4j_utils.Driver):
         tail_join_node:
             Ontology class of the node to join the head ontology to.
     """
+
     def __init__(
         self,
-        driver: Optional['neo4j.Driver'] = None,
         db_name: Optional[str] = None,
         db_uri: Optional[str] = None,
         db_user: Optional[str] = None,
         db_passwd: Optional[str] = None,
-        multi_db: Optional[bool] = None,
+        # multi_db: Optional[bool] = None,
         fetch_size: int = 1000,
         skip_bad_relationships: bool = False,
         skip_duplicate_nodes: bool = False,
@@ -125,15 +114,9 @@ class Driver(neo4j_utils.Driver):
         tail_join_node: Optional[str] = None,
     ):
 
-        # Neo4j options
-        db_name = db_name or _config('neo4j_db')
-        db_uri = db_uri or _config('neo4j_uri')
-        db_user = db_user or _config('neo4j_user')
-        db_passwd = db_passwd or _config('neo4j_pw')
-        multi_db = multi_db or _config('neo4j_multi_db')
-        self.db_delim = delimiter or _config('neo4j_delimiter')
-        self.db_adelim = array_delimiter or _config('neo4j_array_delimiter')
-        self.db_quote = quote_char or _config('neo4j_quote_char')
+        self.db_delim = delimiter
+        self.db_adelim = array_delimiter
+        self.db_quote = quote_char
 
         self.skip_bad_relationships = skip_bad_relationships
         self.skip_duplicate_nodes = skip_duplicate_nodes
@@ -186,11 +169,8 @@ class Driver(neo4j_utils.Driver):
             }
 
             self.driver = None
-            self._db_name = db_name
-
+            
         else:
-
-            neo4j_utils.Driver.__init__(**locals())
 
             # if db representation node does not exist or explicitly
             # asked for wipe, create new graph representation: default
@@ -224,74 +204,14 @@ class Driver(neo4j_utils.Driver):
         self.batch_writer = None
         self._update_translator()
 
+        return self
+
         # TODO: implement passing a driver instance
         # I am not sure, but seems like it should work from driver
 
+    @abstractmethod
     def update_meta_graph(self):
-
-        if self.offline:
-            return
-
-        logger.info('Updating Neo4j meta graph.')
-        # add version node
-        self.add_biocypher_nodes(self.db_meta)
-
-        # find current version node
-        db_version = self.query(
-            'MATCH (v:BioCypher) '
-            'WHERE NOT (v)-[:PRECEDES]->() '
-            'RETURN v',
-        )
-        # connect version node to previous
-        if db_version[0]:
-            e_meta = BioCypherEdge(
-                self.db_meta.graph_state['id'],
-                self.db_meta.node_id,
-                'PRECEDES',
-            )
-            self.add_biocypher_edges(e_meta)
-
-        # add structure nodes
-        no_l = []
-        # leaves of the hierarchy specified in schema yaml
-        for entity, params in self.db_meta.leaves.items():
-            no_l.append(
-                BioCypherNode(
-                    node_id=entity,
-                    node_label='MetaNode',
-                    properties=params,
-                ),
-            )
-        self.add_biocypher_nodes(no_l)
-
-        # remove connection of structure nodes from previous version
-        # node(s)
-        self.query('MATCH ()-[r:CONTAINS]-()'
-                   'DELETE r', )
-
-        # connect structure nodes to version node
-        ed_v = []
-        current_version = self.db_meta.get_id()
-        for entity in self.db_meta.leaves.keys():
-            ed_v.append(
-                BioCypherEdge(
-                    source_id=current_version,
-                    target_id=entity,
-                    relationship_label='CONTAINS',
-                ),
-            )
-        self.add_biocypher_edges(ed_v)
-
-        # add graph structure between MetaNodes
-        ed = []
-        for no in no_l:
-            id = no.get_id()
-            src = no.get_properties().get('source')
-            tar = no.get_properties().get('target')
-            if None not in [id, src, tar]:
-                ed.append(BioCypherEdge(id, src, 'IS_SOURCE_OF'))
-                ed.append(BioCypherEdge(id, tar, 'IS_TARGET_OF'))
-        self.add_biocypher_edges(ed)
+        raise NotImplementedError("Database driver must override 'update_meta_graph'")
 
     def _update_translator(self):
 
@@ -300,42 +220,16 @@ class Driver(neo4j_utils.Driver):
             strict_mode=self.strict_mode,
         )
 
+    @abstractmethod
     def init_db(self):
         """
-        Used to initialise a property graph database by deleting
-        contents and constraints and setting up new constraints.
-
-        Todo:
-            - set up constraint creation interactively depending on the
-                need of the database
+        Placeholder for db initialisation for the database drivers.
+        Tasks performed are:
+            * clear database from old content
+            * clear old constraints
+            * set up new constraints
         """
-
-        self.wipe_db()
-        self._create_constraints()
-        logger.info('Initialising database.')
-
-    def _create_constraints(self):
-        """
-        Creates constraints on node types in the graph. Used for
-        initial setup.
-
-        Grabs leaves of the ``schema_config.yaml`` file and creates
-        constraints on the id of all entities represented as nodes.
-        """
-
-        logger.info('Creating constraints for node types in config.')
-
-        # get structure
-        for leaf in self.db_meta.leaves.items():
-            label = leaf[0]
-            if leaf[1]['represented_as'] == 'node':
-
-                s = (
-                    f'CREATE CONSTRAINT `{label}_id` '
-                    f'IF NOT EXISTS ON (n:`{label}`) '
-                    'ASSERT n.id IS UNIQUE'
-                )
-                self.query(s)
+        raise NotImplementedError("Database driver must override 'init_db'")
 
     def add_nodes(self, id_type_tuples: Iterable[tuple]) -> tuple:
         """
@@ -392,180 +286,18 @@ class Driver(neo4j_utils.Driver):
         bn = self.translator.translate_edges(id_src_tar_type_tuples)
         return self.add_biocypher_edges(bn)
 
-    def add_biocypher_nodes(
-        self,
-        nodes: Iterable[BioCypherNode],
-        explain: bool = False,
-        profile: bool = False,
-    ) -> bool:
-        """
-        Accepts a node type handoff class
-        (:class:`biocypher.create.BioCypherNode`) with id,
-        label, and a dict of properties (passing on the type of
-        property, ie, ``int``, ``str``, ...).
+    @abstractmethod
+    def add_biocypher_nodes(self):
+        raise NotImplementedError("Database driver must override 'add_biocypher_nodes'")
 
-        The dict retrieved by the
-        :meth:`biocypher.create.BioCypherNode.get_dict()` method is
-        passed into Neo4j as a map of maps, explicitly encoding node id
-        and label, and adding all other properties from the 'properties'
-        key of the dict. The merge is performed via APOC, matching only
-        on node id to prevent duplicates. The same properties are set on
-        match and on create, irrespective of the actual event.
-
-        Args:
-            nodes:
-                An iterable of :class:`biocypher.create.BioCypherNode` objects.
-            explain:
-                Call ``EXPLAIN`` on the CYPHER query.
-            profile:
-                Do profiling on the CYPHER query.
-
-        Returns:
-            True for success, False otherwise.
-        """
-
-        try:
-
-            entities = [
-                node.get_dict() for node in _misc.ensure_iterable(nodes)
-            ]
-
-        except AttributeError:
-
-            msg = 'Nodes must have a `get_dict` method.'
-            logger.error(msg)
-
-            raise ValueError(msg)
-
-        logger.info(f'Merging {len(entities)} nodes.')
-
-        entity_query = (
-            'UNWIND $entities AS ent '
-            'CALL apoc.merge.node([ent.node_label], '
-            '{id: ent.node_id}, ent.properties, ent.properties) '
-            'YIELD node '
-            'RETURN node'
-        )
-
-        method = 'explain' if explain else 'profile' if profile else 'query'
-
-        result = getattr(self, method)(
-            entity_query,
-            parameters={
-                'entities': entities,
-            },
-        )
-
-        logger.info('Finished merging nodes.')
-
-        return result
-
-    def add_biocypher_edges(
-        self,
-        edges: Iterable[BioCypherEdge],
-        explain: bool = False,
-        profile: bool = False,
-    ) -> bool:
-        """
-        Accepts an edge type handoff class
-        (:class:`biocypher.create.BioCypherEdge`) with source
-        and target ids, label, and a dict of properties (passing on the
-        type of property, ie, int, string ...).
-
-        The individual edge is either passed as a singleton, in the case
-        of representation as an edge in the graph, or as a 4-tuple, in
-        the case of representation as a node (with two edges connecting
-        to interaction partners).
-
-        The dict retrieved by the
-        :meth:`biocypher.create.BioCypherEdge.get_dict()` method is
-        passed into Neo4j as a map of maps, explicitly encoding source
-        and target ids and the relationship label, and adding all edge
-        properties from the 'properties' key of the dict. The merge is
-        performed via APOC, matching only on source and target id to
-        prevent duplicates. The same properties are set on match and on
-        create, irrespective of the actual event.
-
-        Args:
-            edges:
-                An iterable of :class:`biocypher.create.BioCypherEdge` objects.
-            explain:
-                Call ``EXPLAIN`` on the CYPHER query.
-            profile:
-                Do profiling on the CYPHER query.
-
-        Returns:
-            `True` for success, `False` otherwise.
-        """
-
-        edges = _misc.ensure_iterable(edges)
-        edges = itertools.chain(*(_misc.ensure_iterable(i) for i in edges))
-
-        nodes = []
-        rels = []
-
-        try:
-
-            for e in edges:
-
-                if hasattr(e, 'get_node'):
-
-                    nodes.append(e.get_node())
-                    rels.append(e.get_source_edge().get_dict())
-                    rels.append(e.get_target_edge().get_dict())
-
-                else:
-
-                    rels.append(e.get_dict())
-
-        except AttributeError:
-
-            msg = 'Edges and nodes must have a `get_dict` method.'
-            logger.error(msg)
-
-            raise ValueError(msg)
-
-        self.add_biocypher_nodes(nodes)
-        logger.info(f'Merging {len(rels)} edges.')
-
-        # cypher query
-
-        # merging only on the ids of the entities, passing the
-        # properties on match and on create;
-        # TODO add node labels?
-        node_query = (
-            'UNWIND $rels AS r '
-            'MERGE (src {id: r.source_id}) '
-            'MERGE (tar {id: r.target_id}) '
-        )
-
-        self.query(node_query, parameters={'rels': rels})
-
-        edge_query = (
-            'UNWIND $rels AS r '
-            'MATCH (src {id: r.source_id}) '
-            'MATCH (tar {id: r.target_id}) '
-            'WITH src, tar, r '
-            'CALL apoc.merge.relationship'
-            '(src, r.relationship_label, NULL, '
-            'r.properties, tar, r.properties) '
-            'YIELD rel '
-            'RETURN rel'
-        )
-
-        method = 'explain' if explain else 'profile' if profile else 'query'
-
-        result = getattr(self, method)(edge_query, parameters={'rels': rels})
-
-        logger.info('Finished merging edges.')
-
-        return result
+    @abstractmethod
+    def add_biocypher_edges(self):
+        raise NotImplementedError("Database driver must override 'add_biocypher_edges'")
 
     def write_nodes(self, nodes):
         """
-        Write BioCypher nodes to disk using the :mod:`write` module,
-        formatting the CSV to enable Neo4j admin import from the target
-        directory.
+        Write BioCypher nodes to disk, formatting the CSV to 
+        enable database-specific import from the target directory.
 
         Args:
             nodes (iterable): collection of nodes to be written in
@@ -588,29 +320,16 @@ class Driver(neo4j_utils.Driver):
         # write node files
         return self.batch_writer.write_nodes(tnodes)
 
+    @abstractmethod
     def start_batch_writer(self, ) -> None:
         """
-        Instantiate the batch writer if it does not exist.
+        Abstract mehtod to instantiate the batch writer if it does not exist. Writer should be implement on a database level.
 
         Args:
             dirname (str): the directory to write the files to
             db_name (str): the name of the database to write the files to
         """
-        if not self.batch_writer:
-            self.batch_writer = BatchWriter(
-                leaves=self.db_meta.leaves,
-                ontology_adapter=self.ontology_adapter,
-                translator=self.translator,
-                delimiter=self.db_delim,
-                array_delimiter=self.db_adelim,
-                quote=self.db_quote,
-                dirname=self.output_directory,
-                db_name=self._db_name,
-                skip_bad_relationships=self.skip_bad_relationships,
-                skip_duplicate_nodes=self.skip_duplicate_nodes,
-                wipe=self.wipe,
-                strict_mode=self.strict_mode,
-            )
+        raise NotImplementedError("Database driver must override 'add_biocypher_edges'")
 
     def start_ontology_adapter(self) -> None:
         """
@@ -668,7 +387,7 @@ class Driver(neo4j_utils.Driver):
         delimiters, database name, and paths of node and edge files.
 
         Returns:
-            str: a neo4j-admin import call
+            str: a database-specific import call
         """
         return self.batch_writer.get_import_call()
 
@@ -814,6 +533,6 @@ class Driver(neo4j_utils.Driver):
 
         return self.translator.reverse_translate(query)
 
+    @abstractmethod
     def __repr__(self):
-
-        return f'<BioCypher {neo4j_utils.Driver.__repr__(self)[1:]}'
+        raise NotImplementedError("Database driver must override '__repr__'")

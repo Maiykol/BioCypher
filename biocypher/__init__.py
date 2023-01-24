@@ -20,9 +20,13 @@ __all__ = [
     'logfile',
     'log',
     'Driver',
+    'Neo4jDriver',
+    'PostgresDriver'
 ]
 
 from ._config import config, module_data
-from ._driver import Driver
+from .db_modules.neo4j._driver import Neo4jDriver as Driver
+from .db_modules.neo4j._driver import Neo4jDriver
+from .db_modules.postgresql._driver import PostgresDriver
 from ._logger import log, logfile
 from ._metadata import __author__, __version__
